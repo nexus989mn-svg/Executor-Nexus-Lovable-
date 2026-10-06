@@ -1,0 +1,9 @@
+{
+  "name": "nexus-chromium-executor",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "playwright-core": "1.63.0",
+    "http-proxy": "1.18.1"
+  }
+}
