@@ -53,7 +53,8 @@ start("x11vnc", [
 ]);
 
 start("python3", [
-  "-m", "http.server", "6080",
+  "-m", "http.server",
+  "6080",
   "--bind", "127.0.0.1",
   "--directory", "/usr/share/novnc"
 ]);
@@ -113,6 +114,163 @@ function serial(fn) {
   return next;
 }
 
+async function executeAction(p, body) {
+  const action = body?.action;
+  const timeout = Number(body?.timeout || 15000);
+
+  switch (action) {
+    case "navigate": {
+      const url = String(body?.url || "");
+
+      if (!/^https?:\/\//i.test(url)) {
+        throw new Error("url must be http/https");
+      }
+
+      await p.goto(url, {
+        waitUntil: body.waitUntil || "domcontentloaded",
+        timeout
+      });
+
+      return {
+        action,
+        url: p.url(),
+        title: await p.title()
+      };
+    }
+
+    case "click":
+      await p
+        .locator(String(body.selector))
+        .first()
+        .click({ timeout });
+
+      return {
+        action,
+        url: p.url(),
+        title: await p.title()
+      };
+
+    case "fill":
+      await p
+        .locator(String(body.selector))
+        .first()
+        .fill(String(body.text ?? ""), { timeout });
+
+      return {
+        action,
+        url: p.url(),
+        title: await p.title()
+      };
+
+    case "select":
+      await p
+        .locator(String(body.selector))
+        .first()
+        .selectOption(body.value, { timeout });
+
+      return {
+        action,
+        url: p.url(),
+        title: await p.title()
+      };
+
+    case "press":
+      if (body.selector) {
+        await p
+          .locator(String(body.selector))
+          .first()
+          .press(String(body.key || "Enter"), { timeout });
+      } else {
+        await p.keyboard.press(String(body.key || "Enter"));
+      }
+
+      return {
+        action,
+        url: p.url(),
+        title: await p.title()
+      };
+
+    case "back":
+      await p
+        .goBack({
+          waitUntil: "domcontentloaded",
+          timeout
+        })
+        .catch(() => {});
+
+      return {
+        action,
+        url: p.url(),
+        title: await p.title()
+      };
+
+    case "forward":
+      await p
+        .goForward({
+          waitUntil: "domcontentloaded",
+          timeout
+        })
+        .catch(() => {});
+
+      return {
+        action,
+        url: p.url(),
+        title: await p.title()
+      };
+
+    case "wait":
+      if (body.selector) {
+        await p
+          .locator(String(body.selector))
+          .first()
+          .waitFor({
+            state: body.state || "visible",
+            timeout
+          });
+      } else {
+        await p.waitForTimeout(Number(body.ms || 1000));
+      }
+
+      return {
+        action,
+        url: p.url(),
+        title: await p.title()
+      };
+
+    case "content": {
+      const text = await p
+        .locator("body")
+        .innerText({ timeout });
+
+      return {
+        action,
+        url: p.url(),
+        title: await p.title(),
+        text: text.slice(0, 200000)
+      };
+    }
+
+    case "screenshot": {
+      const image = await p.screenshot({
+        type: "png",
+        fullPage: Boolean(body.fullPage)
+      });
+
+      return {
+        action,
+        url: p.url(),
+        title: await p.title(),
+        image: image.toString("base64")
+      };
+    }
+
+    default:
+      throw new Error(
+        "unknown action: " + String(action)
+      );
+  }
+}
+
 const vncProxy = httpProxy.createProxyServer({
   target: "http://127.0.0.1:6080",
   changeOrigin: true
@@ -123,13 +281,17 @@ vncProxy.on("error", (_err, _req, res) => {
     res.writeHead(502, {
       "content-type": "text/plain"
     });
+
     res.end("noVNC unavailable");
   }
 });
 
 const server = http.createServer(async (req, res) => {
   try {
-    const u = new URL(req.url || "/", "http://localhost");
+    const u = new URL(
+      req.url || "/",
+      "http://localhost"
+    );
 
     if (
       req.method === "GET" &&
@@ -154,6 +316,7 @@ const server = http.createServer(async (req, res) => {
           (version.stdout || version.stderr || "").trim(),
         chromiumBinaryOk: version.status === 0,
         vnc: true,
+        batchActions: true,
         actions: [
           "navigate",
           "click",
@@ -177,6 +340,7 @@ const server = http.createServer(async (req, res) => {
 
       if (req.method === "POST") {
         const body = await readBody(req);
+
         target =
           typeof body?.url === "string"
             ? body.url.trim()
@@ -212,185 +376,62 @@ const server = http.createServer(async (req, res) => {
 
     if (
       req.method === "POST" &&
-      u.pathname === "/api/browser/action"
+      u.pathname === "/api/browser/actions"
     ) {
       const body = await readBody(req);
-      const action = body?.action;
+      const actions = Array.isArray(body?.actions)
+        ? body.actions
+        : [];
+
+      if (!actions.length) {
+        return json(res, 400, {
+          ok: false,
+          error: "actions must be a non-empty array"
+        });
+      }
 
       const result = await serial(async () => {
         const p = await ensureBrowser();
-        const timeout = Number(body?.timeout || 15000);
+        const results = [];
 
-        switch (action) {
-          case "navigate":
-            if (
-              !/^https?:\/\//i.test(
-                String(body?.url || "")
-              )
-            ) {
-              throw new Error(
-                "url must be http/https"
-              );
-            }
-
-            await p.goto(
-              String(body.url),
-              {
-                waitUntil:
-                  body.waitUntil ||
-                  "domcontentloaded",
-                timeout
-              }
-            );
-
-            return {
-              url: p.url(),
-              title: await p.title()
-            };
-
-          case "click":
-            await p
-              .locator(String(body.selector))
-              .first()
-              .click({ timeout });
-
-            return {
-              url: p.url(),
-              title: await p.title()
-            };
-
-          case "fill":
-            await p
-              .locator(String(body.selector))
-              .first()
-              .fill(
-                String(body.text ?? ""),
-                { timeout }
-              );
-
-            return {
-              url: p.url(),
-              title: await p.title()
-            };
-
-          case "select":
-            await p
-              .locator(String(body.selector))
-              .first()
-              .selectOption(
-                body.value,
-                { timeout }
-              );
-
-            return {
-              url: p.url(),
-              title: await p.title()
-            };
-
-          case "press":
-            if (body.selector) {
-              await p
-                .locator(String(body.selector))
-                .first()
-                .press(
-                  String(body.key || "Enter"),
-                  { timeout }
-                );
-            } else {
-              await p.keyboard.press(
-                String(body.key || "Enter")
-              );
-            }
-
-            return {
-              url: p.url(),
-              title: await p.title()
-            };
-
-          case "back":
-            await p
-              .goBack({
-                waitUntil: "domcontentloaded",
-                timeout
-              })
-              .catch(() => {});
-
-            return {
-              url: p.url(),
-              title: await p.title()
-            };
-
-          case "forward":
-            await p
-              .goForward({
-                waitUntil: "domcontentloaded",
-                timeout
-              })
-              .catch(() => {});
-
-            return {
-              url: p.url(),
-              title: await p.title()
-            };
-
-          case "wait":
-            if (body.selector) {
-              await p
-                .locator(String(body.selector))
-                .first()
-                .waitFor({
-                  state: body.state || "visible",
-                  timeout
-                });
-            } else {
-              await p.waitForTimeout(
-                Number(body.ms || 1000)
-              );
-            }
-
-            return {
-              url: p.url(),
-              title: await p.title()
-            };
-
-          case "content":
-            return {
-              url: p.url(),
-              title: await p.title(),
-              text: (
-                await p
-                  .locator("body")
-                  .innerText({ timeout })
-              ).slice(0, 200000)
-            };
-
-          case "screenshot": {
-            const image =
-              await p.screenshot({
-                type: "png",
-                fullPage:
-                  Boolean(body.fullPage)
-              });
-
-            return {
-              url: p.url(),
-              title: await p.title(),
-              image:
-                image.toString("base64")
-            };
-          }
-
-          default:
-            throw new Error(
-              "unknown action: " +
-              String(action)
-            );
+        for (const step of actions) {
+          results.push(
+            await executeAction(p, step)
+          );
         }
+
+        return {
+          url: p.url(),
+          title: await p.title(),
+          results
+        };
       });
 
       return json(res, 200, {
         ok: true,
-        action,
+        action: "batch",
+        result
+      });
+    }
+
+    if (
+      req.method === "POST" &&
+      u.pathname === "/api/browser/action"
+    ) {
+      const body = await readBody(req);
+
+      const result = await serial(async () => {
+        const p = await ensureBrowser();
+
+        return await executeAction(
+          p,
+          body
+        );
+      });
+
+      return json(res, 200, {
+        ok: true,
+        action: body?.action,
         result
       });
     }
@@ -439,8 +480,7 @@ iframe{
 </html>`;
 
       res.writeHead(200, {
-        "content-type":
-          "text/html; charset=utf-8"
+        "content-type": "text/html; charset=utf-8"
       });
 
       return res.end(html);
@@ -449,6 +489,8 @@ iframe{
     return vncProxy.web(req, res);
 
   } catch (error) {
+    console.error("Request error:", error);
+
     return json(res, 500, {
       ok: false,
       error:
@@ -460,15 +502,12 @@ iframe{
 });
 
 server.on("upgrade", (req, socket, head) => {
-  const wsProxy =
-    httpProxy.createProxyServer({
-      target: "ws://127.0.0.1:6081",
-      ws: true
-    });
+  const wsProxy = httpProxy.createProxyServer({
+    target: "ws://127.0.0.1:6081",
+    ws: true
+  });
 
-  wsProxy.on("error", () =>
-    socket.destroy()
-  );
+  wsProxy.on("error", () => socket.destroy());
 
   wsProxy.ws(
     req,
